@@ -22,6 +22,8 @@ type BlogResult = {
 type ScrapedContent = {
   pageTitle: string;
   bodyText: string;
+  scrapeFailed: boolean;
+  scrapeErrorReason?: string;
 };
 
 type GeminiApiVersion = "v1" | "v1beta";
@@ -122,50 +124,91 @@ function sanitizeGuideline(input: unknown): GuidelineInput {
   };
 }
 
+// 실제 브라우저에 가까운 헤더 세트 (일부 사이트의 단순 UA 차단은 완화될 수 있음)
+const BROWSER_LIKE_HEADERS = {
+  "user-agent":
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+  accept:
+    "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+  "accept-language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
+  "upgrade-insecure-requests": "1",
+  "sec-fetch-dest": "document",
+  "sec-fetch-mode": "navigate",
+  "sec-fetch-site": "none",
+};
+
+/**
+ * 스크래핑은 "참고용"이므로, 실패하더라도 예외를 던지지 않고
+ * scrapeFailed: true 상태로 반환한다. 상위 로직은 이 경우 참고 텍스트 없이
+ * 사용자 가이드라인만으로 글을 생성한다.
+ */
 async function scrapeTravelProduct(url: URL): Promise<ScrapedContent> {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
 
-  const response = await fetch(url, {
-    headers: {
-      "user-agent":
-        "Mozilla/5.0 (compatible; TravelSellerBot/2.0; +https://example.com/bot)",
-      accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-      "accept-language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
-    },
-    cache: "no-store",
-    signal: controller.signal,
-  }).finally(() => clearTimeout(timeout));
+  try {
+    const response = await fetch(url, {
+      headers: BROWSER_LIKE_HEADERS,
+      cache: "no-store",
+      redirect: "follow",
+      signal: controller.signal,
+    });
 
-  if (!response.ok) {
-    throw new Error(
-      "웹페이지를 불러오지 못했습니다. 접근 가능한 URL인지 확인해주세요.",
+    if (!response.ok) {
+      console.error(
+        `[scrape] non-ok response: ${response.status} ${response.statusText} for ${url.toString()}`,
+      );
+      return {
+        pageTitle: "",
+        bodyText: "",
+        scrapeFailed: true,
+        scrapeErrorReason: `status ${response.status}`,
+      };
+    }
+
+    const html = await response.text();
+    const pageTitle =
+      getTagContent(html, "title") ||
+      getMetaContent(html, "og:title") ||
+      getMetaContent(html, "twitter:title") ||
+      "";
+
+    const bodyText = shortenText(
+      getMetaContent(html, "description") ||
+        getMetaContent(html, "og:description") ||
+        getMetaContent(html, "twitter:description") ||
+        getBodyText(html),
+      MAX_SCRAPED_TEXT_LENGTH,
     );
+
+    if (!bodyText) {
+      return {
+        pageTitle,
+        bodyText: "",
+        scrapeFailed: true,
+        scrapeErrorReason: "본문 텍스트 추출 실패",
+      };
+    }
+
+    return {
+      pageTitle,
+      bodyText,
+      scrapeFailed: false,
+    };
+  } catch (error) {
+    // AbortError(타임아웃) 포함 모든 네트워크 예외를 여기서 흡수
+    const reason = error instanceof Error ? error.message : "unknown error";
+    console.error(`[scrape] fetch threw for ${url.toString()}: ${reason}`);
+
+    return {
+      pageTitle: "",
+      bodyText: "",
+      scrapeFailed: true,
+      scrapeErrorReason: reason,
+    };
+  } finally {
+    clearTimeout(timeout);
   }
-
-  const html = await response.text();
-  const pageTitle =
-    getTagContent(html, "title") ||
-    getMetaContent(html, "og:title") ||
-    getMetaContent(html, "twitter:title") ||
-    "상품 제목을 찾지 못했어요";
-
-  const bodyText = shortenText(
-    getMetaContent(html, "description") ||
-      getMetaContent(html, "og:description") ||
-      getMetaContent(html, "twitter:description") ||
-      getBodyText(html),
-    MAX_SCRAPED_TEXT_LENGTH,
-  );
-
-  if (!bodyText) {
-    throw new Error("본문 텍스트를 추출하지 못했습니다.");
-  }
-
-  return {
-    pageTitle,
-    bodyText,
-  };
 }
 
 function buildAiPrompt({
@@ -177,11 +220,21 @@ function buildAiPrompt({
   scraped: ScrapedContent;
   guideline: GuidelineInput;
 }) {
+  const referenceSection = scraped.scrapeFailed
+    ? `[참고용 타사 URL 정보]
+- URL: ${url}
+- 안내: 이 URL의 페이지 정보를 가져오지 못했습니다. 참고 텍스트 없이, 아래 사용자 가이드라인만으로 글을 작성하세요.`
+    : `[참고용 타사 URL 정보]
+- URL: ${url}
+- 타이틀: ${scraped.pageTitle}
+- 본문 참고 텍스트:
+${scraped.bodyText}`;
+
   return `
 당신은 네이버 블로그용 여행 마케팅 포스팅을 작성하는 한국어 카피라이터입니다.
 
 [최우선 규칙]
-- 타사 URL 데이터는 풍성한 묘사, 표현, 글감 참고용으로만 사용하세요.
+- 타사 URL 데이터는 풍성한 묘사, 표현, 글감 참고용으로만 사용하세요. 참고 정보가 없다면 사용자 가이드라인만으로 충분히 매력적인 글을 작성하세요.
 - 실제 블로그 글의 핵심 뼈대는 반드시 사용자가 직접 입력한 정보가 100% 최우선입니다.
 - 코스 순서, 출발 시간/미팅 장소, 차별화 혜택, 판매 가격은 사용자가 준 값을 임의 변경하거나 타사 정보로 덮어쓰면 안 됩니다.
 - 타사 페이지에 다른 가격, 다른 동선, 다른 혜택이 있더라도 그대로 옮기지 말고 사용자 가이드라인 기준으로 재창조하세요.
@@ -217,11 +270,7 @@ function buildAiPrompt({
 - 우리 상품만의 차별화 혜택: ${guideline.differentiators}
 - 정확한 판매 가격: ${guideline.price}
 
-[참고용 타사 URL 정보]
-- URL: ${url}
-- 타이틀: ${scraped.pageTitle}
-- 본문 참고 텍스트:
-${scraped.bodyText}
+${referenceSection}
 `.trim();
 }
 
@@ -272,7 +321,7 @@ async function callGemini(prompt: string) {
 
   if (!apiKey) {
     throw new Error(
-      "GEMINI_API_KEY가 설정되지 않았습니다. 프로젝트 루트에 `.env.local` 또는 `.env` 파일을 만들고 `GEMINI_API_KEY=발급받은키` 형식으로 추가해주세요.",
+      "GEMINI_API_KEY가 설정되지 않았습니다. Vercel 프로젝트 설정 > Environment Variables에 GEMINI_API_KEY를 추가해주세요.",
     );
   }
 
@@ -406,11 +455,15 @@ export async function POST(request: Request) {
       );
     }
 
+    // 중요: 스크래핑은 참고용일 뿐이라 실패해도 전체 요청을 막지 않는다.
     const scraped = await scrapeTravelProduct(targetUrl);
 
-    // 중요:
-    // 외부 페이지의 정보는 "묘사 참고용"으로만 사용하고,
-    // 실제 글의 뼈대는 판매자가 입력한 가이드라인을 100% 우선 반영한다.
+    if (scraped.scrapeFailed) {
+      console.warn(
+        `[api/scrape] scraping failed (${scraped.scrapeErrorReason}), proceeding with guideline-only prompt`,
+      );
+    }
+
     const prompt = buildAiPrompt({
       url: targetUrl.toString(),
       scraped,
@@ -431,7 +484,13 @@ export async function POST(request: Request) {
     }
 
     return NextResponse.json({
-      scraped,
+      scraped: {
+        pageTitle: scraped.pageTitle,
+        bodyText: scraped.bodyText,
+      },
+      scrapeWarning: scraped.scrapeFailed
+        ? "타사 URL 정보를 가져오지 못해 참고 없이 작성되었습니다. 사용자 입력 정보만으로 글이 생성됐습니다."
+        : null,
       result,
     });
   } catch (error) {
